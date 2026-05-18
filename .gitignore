@@ -1,0 +1,12 @@
+tken
+tken.exe
+*.o
+*.a
+*.so
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+build/
+dist/
