@@ -147,4 +147,4 @@ Pull requests welcome. Please test on your platform before submitting.
 
 ## Author
 
-Created by Muhammad (@6876h9)
+Created by (@6876h9)
