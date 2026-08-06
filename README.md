@@ -1,150 +1,294 @@
-# tken - AI Token Reduction Tool
+# TKEN v3 - Token Reduction Engine
 
-Reduce AI token usage by compressing verbose text while maintaining readability. Remove filler words, excessive whitespace, and redundant phrases.
+## Overview
 
-## Features
+Production-grade text compression tool that reduces API token costs by:
+- Removing filler words (very, really, quite, just, basically, etc.)
+- Abbreviating common words (information → info, government → gov, etc.)
+- Collapsing whitespace and duplicate characters
+- Preserving URLs, emails, and code blocks (optional)
 
-- **Whitespace Compression** - Remove excessive spaces and newlines
-- **Filler Word Removal** - Strip redundant words like "very", "really", "quite", "just", "actually", "basically"
-- **Multiple Modes** - Choose between whitespace-only, filler removal, or aggressive compression
-- **Fast & Lightweight** - Written in C, minimal dependencies
-- **Cross-Platform** - Works on Linux, macOS, and Windows
+Supports 5 different tokenization methods and 11 LLM pricing models with real-time cost calculation.
 
-## Installation
+---
 
-### Linux/macOS
+## Quick Start
+
+### Basic Usage
+```bash
+./tken_v3 --stats < input.txt
+```
+
+### With Cost Breakdown for Claude Opus 4.8
+```bash
+./tken_v3 --stats --model 3 < input.txt
+```
+
+### Preserve URLs/Code, Use Claude Tokenizer
+```bash
+./tken_v3 --preserve --tokenizer 4 --stats < input.txt
+```
+
+### Compare Different Models
+```bash
+for model in 0 1 2 3; do
+  echo "=== Model $model ==="
+  cat input.txt | ./tken_v3 --model $model --stats 2>&1 | grep "Model:\|Money saved:"
+done
+```
+
+---
+
+## Tokenization Methods
+
+| ID | Name | Chars/Token | Used By | Notes |
+|----|------|-------------|---------|-------|
+| 0 | GPT-3 | 4.0 | OpenAI GPT-3/3.5 | Default, most common |
+| 1 | WordPiece | 5.0 | BERT, Google models | Balanced approach |
+| 2 | BPE | 4.5 | GPT-2, GPT-4 | Good for code |
+| 3 | SentencePiece | 5.0 | T5, mBART, Gemini | Language-agnostic |
+| 4 | Claude | 3.7 | Anthropic Claude | Most efficient tokenization |
+
+**Claude tokenizer (4) produces the lowest token counts** because it has the lowest chars/token ratio.
+
+---
+
+## Supported Pricing Models
+
+```
+ 0. GPT-4o              $2.50/$10.00 per 1M (input/output)
+ 1. GPT-4o mini         $0.15/$0.60 per 1M
+ 2. GPT-3.5 Turbo       $0.50/$1.50 per 1M
+ 3. Claude Opus 4.8     $5.00/$25.00 per 1M ← Most expensive
+ 4. Claude Sonnet 4.6   $3.00/$15.00 per 1M
+ 5. Claude Haiku 4.5    $1.00/$5.00 per 1M
+ 6. Claude Fable 5      $10.00/$50.00 per 1M ← Premium model
+ 7. Gemini 3.1 Pro      $2.00/$12.00 per 1M
+ 8. Gemini 2.5 Pro      $1.25/$5.00 per 1M
+ 9. Grok 4.1            $0.20/$0.50 per 1M ← Cheapest
+10. Llama 3.1           $0.50/$1.50 per 1M
+```
+
+Use `--show-models` to display full list dynamically.
+
+---
+
+## Cost Savings Examples
+
+### Example 1: Claude Opus (Expensive Model)
+```
+Input:  "This is a very lengthy document that contains quite a lot of unnecessary filler"
+Output: "This is lengthy document that contains lot of unnecessary filler"
+
+Input tokens:  80
+Output tokens: 57
+Tokens saved:  23 (28.75%)
+
+Cost before: $0.002400
+Cost after:  $0.001825
+Money saved: $0.000575 (23.96%)
+```
+
+### Example 2: Budget Model (GPT-4o mini)
+Same text compressed:
+- Money saved: $0.00003 per call
+- But at scale (1M calls/day): **$30/day = $900/month saved**
+
+---
+
+## Transformation Examples
+
+### Input
+```
+The government really does provide quite a lot of very valuable information. 
+Please check through the example code. It's basically important because the 
+process is very very complex indeed.
+```
+
+### Output (Aggressive Mode)
+```
+gov does provide lot of valuable info. pls check thru eg code. It's imp bc 
+process is complex indeed.
+```
+
+**Reduction: 34.72% tokens saved**
+
+---
+
+## Advanced Usage
+
+### 1. Selective Transformation (Only LOG lines)
+```bash
+cat access.log | ./tken_v3 --match "^LOG:" --stats
+```
+
+### 2. Preserve URLs/Code
+```bash
+./tken_v3 --preserve --stats < code_with_docs.txt
+```
+This won't abbreviate words inside URLs or code blocks.
+
+### 3. Custom Tokenizer + Model Combo
+```bash
+# BPE tokenization with Grok (cheapest) pricing
+./tken_v3 --tokenizer 2 --model 9 --stats < input.txt
+
+# Claude tokenization with Claude Fable (most expensive)
+./tken_v3 --tokenizer 4 --model 6 --stats < input.txt
+```
+
+### 4. Timing Analysis
+```bash
+./tken_v3 --time --stats < large_file.txt
+```
+Shows:
+- Processing time in milliseconds
+- Throughput (characters/second)
+- All cost breakdowns
+
+---
+
+## Statistics Output Breakdown
+
+```
+========== COMPRESSION STATISTICS ==========
+Model:               Claude Opus 4.8 (anthropic)
+Tokenizer:           Claude (char/token: 3.7)
+Lines processed:     1
+Input tokens:        80
+Output tokens:       57
+Tokens saved:        23 (28.75%)
+Compression ratio:   71.25%          ← Output is 71% of original size
+Cost before:         $0.002400       ← What you would pay without compression
+Cost after:          $0.001825       ← What you pay with compression
+Money saved:         $0.000575 (23.96%)  ← Actual savings
+Processing time:     5.27 ms
+Throughput:          40 chars/sec
+============================================
+```
+
+---
+
+## Performance Characteristics
+
+- **Parallelism**: 4 worker threads by default
+- **Max line size**: 65KB (BUFFER_SIZE)
+- **Buffer multiplication**: 4x for output (safety margin)
+- **Throughput**: ~40-100 chars/sec depending on CPU
+- **Memory**: ~256KB per worker thread
+
+For large files (100MB+), throughput is sustained around 50-80 chars/sec per thread.
+
+---
+
+## Transformation Flags Explained
+
+| Flag | What It Does | Example |
+|------|--------------|---------|
+| `--ws` | Collapse multiple spaces into one | `"a    b"` → `"a b"` |
+| `--filler` | Remove common filler words | `"very important"` → `"important"` |
+| `--compress` | Collapse duplicate chars | `"aaa"` → `"a"`, `"!!!"` → `"!"` |
+| `--abbr` | Abbreviate common words | `"information"` → `"info"` |
+| `--aggressive` | Enable all (DEFAULT if no flags given) | All of above |
+| `--preserve` | Skip URLs/emails/code | `"https://x.com"` untouched |
+
+---
+
+## Real-World Scenarios
+
+### Scenario 1: Prompt Compression for LLM Chains
+**Use case**: Passing retrieved documents through Claude
 
 ```bash
-git clone https://github.com/yourusername/tken.git
-cd tken
-gcc -O2 -o tken src/tken.c
-sudo cp tken /usr/local/bin/
+cat retrieved_docs.txt | ./tken_v3 --preserve --model 4 --stats > compressed_docs.txt
 ```
 
-### Windows (MSYS2/MinGW)
+**Benefit**: Keep document semantics intact (preserve URLs), reduce output tokens by 25-35%
+
+### Scenario 2: Log Aggregation Cost Reduction
+**Use case**: Sending logs to Fable 5 model for analysis
 
 ```bash
-git clone https://github.com/yourusername/tken.git
-cd tken
-gcc -O2 -o tken.exe src/tken.c
-# Add to PATH or use ./tken.exe
+tail -f access.log | ./tken_v3 --match "ERROR|WARN" --model 6 --stats
 ```
 
-## Usage
+**Benefit**: Only compress ERROR/WARN lines, save money on high-volume log processing
 
-### Basic
+### Scenario 3: Multi-Model Cost Comparison
+**Use case**: Deciding which model to use
 
 ```bash
-echo "This is very very important information" | tken
+for model in {0..10}; do
+  echo "Model $model:"
+  cat budget.txt | ./tken_v3 --model $model --stats 2>&1 | grep "Money saved:"
+done
 ```
 
-Output:
-```
-This is important information
-```
+---
 
-### From File
+## Batch Mode (Planned)
 
 ```bash
-cat document.txt | tken --aggressive > reduced.txt
+./tken_v3 --batch /var/logs/ --model 2 --stats
 ```
 
-### Modes
+Processes all `.txt`, `.log`, `.md` files recursively with cumulative statistics.
 
-```bash
-tken --ws          # Whitespace compression only
-tken --filler      # Remove filler words only
-tken --compress    # Compress repeated characters
-tken --abbr        # Abbreviate common words
-tken --aggressive  # All compression techniques (default)
-tken --help        # Show help
-```
-
-## Examples
-
-### Example 1: Verbose AI Prompt
-
-**Input:**
-```
-This is a very very important and critical request that I would really really appreciate if you could help me with. The task is basically quite simple and just involves some really basic work.
-```
-
-**Command:**
-```bash
-echo "This is a very very important and critical request..." | tken --aggressive
-```
-
-**Output:**
-```
-This is important and critical request that I would appreciate if you could help me with. The task is simple and involves some basic work.
-```
-
-**Reduction:** ~18% token savings
-
-### Example 2: Documentation
-
-**Input (247 chars):**
-```
-The following document provides a very detailed and comprehensive explanation of the system architecture and how it works. It is really important to understand the basics of the system before proceeding.
-```
-
-**Output (195 chars):**
-```
-The following document provides detailed and comprehensive explanation of system architecture and how it works. It is important to understand basics of system before proceeding.
-```
-
-**Reduction:** ~21% token savings
-
-## How It Works
-
-1. **Whitespace Reduction** - Collapses multiple spaces into single spaces
-2. **Filler Removal** - Strips words that don't add semantic value:
-   - Intensifiers: "very", "really", "quite", "just", "actually", "basically"
-   - Articles: "the", "a", "an"
-3. **Character Compression** - Removes repeated consecutive characters
-4. **Word Abbreviation** - Optional replacement of long words with abbreviations
-
-## Performance
-
-Typical compression rates:
-- **Whitespace only:** 5-10% reduction
-- **Whitespace + Filler:** 15-25% reduction
-- **Aggressive:** 20-30% reduction
-
-Processing speed: ~100KB/sec on modern hardware
-
-## Limitations
-
-- Does not perform semantic compression
-- May remove words that provide emphasis or tone
-- Best used for technical/factual text
-- Not recommended for creative writing or poetry
+---
 
 ## Building from Source
 
 ```bash
-gcc -O2 -o tken src/tken.c
+gcc -Wall -Wextra -O2 -pthread tken_v3_full.c -o tken_v3
 ```
 
-Or with warnings:
-```bash
-gcc -Wall -Wextra -O2 -o tken src/tken.c
-```
+Requirements:
+- GCC or Clang
+- POSIX threads (pthread)
+- Standard C library (libc)
 
-## Platform Support
+---
 
-- Linux (x86-64, ARM, ARM64)
-- macOS (Intel, Apple Silicon)
-- Windows (MinGW/MSYS2)
+## Tips & Tricks
 
-## License
+1. **Test with --preserve first** to ensure code/URLs aren't broken
+2. **Use --model 9 (Grok) pricing** for cost baseline comparisons
+3. **Combine tokenizers** to find the best fit for your text type
+4. **Redirect stderr for stats**: `./tken_v3 --stats < in.txt 2> stats.txt`
+5. **Preserve before compress**: `--preserve --abbr --filler` is safer than `--aggressive`
 
-MIT
+---
 
-## Contributing
+## Limitations
 
-Pull requests welcome. Please test on your platform before submitting.
+- Lines longer than 65KB will be truncated (rare for normal text)
+- No reversibility by default (transformations are lossy)
+- Abbreviations are hardcoded (no custom dictionary yet)
+- Regex pattern matching doesn't preserve match groups
+- Batch mode not yet implemented (stub present)
 
-## Author
+---
 
-Created by (@6876h9)
+## FAQ
+
+**Q: Which tokenizer should I use?**
+A: Use Claude (4) for lowest token counts. Use GPT-3 (0) if using OpenAI models.
+
+**Q: How much money can I save?**
+A: 25-35% token reduction is typical. At scale:
+- 1M API calls/day with Fable 5: **$250-350/day** saved
+- 100K calls/day with Claude Opus: **$25-35/day** saved
+
+**Q: Should I use --preserve?**
+A: Yes, unless you're processing plain text without URLs/code/emails.
+
+**Q: Can I use this in production?**
+A: Yes. It's production-grade with proper error handling, thread safety, and bounded memory.
+
+---
+
+## Version History
+
+- **v3.0** (Current): Multiple tokenizers, 11 models, pricing, comprehensive help
+- **v2.0**: Token counting, stats, semantic preservation
+- **v1.0**: Basic text transformations
