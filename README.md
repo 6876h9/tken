@@ -1,10 +1,10 @@
-# tokred - Token Reduction Engine
+# tken - Token Reduction Engine
 
 Version 4.0
 
-tokred reduces the size of text before it is sent to a large language model. It removes filler words, abbreviates common words, collapses whitespace, and estimates the token count and API cost before and after reduction. It optionally runs on an NVIDIA GPU through CUDA.
+tken reduces the size of text before it is sent to a large language model. It removes filler words, abbreviates common words, collapses whitespace, and estimates the token count and API cost before and after reduction. It optionally runs on an NVIDIA GPU through CUDA.
 
-tokred changes the text it processes. Always review output before using it for anything where exact wording matters.
+tken changes the text it processes. Review the output before using it where exact wording matters.
 
 ## Features
 
@@ -43,7 +43,7 @@ CUDA build. Set `ARCH` to match your GPU:
 make gpu ARCH=sm_86
 ```
 
-Both targets can be built side by side. The CUDA build produces `tokred_gpu`.
+Both targets can be built side by side. The CUDA build produces `tken_gpu`.
 
 ## Testing
 
@@ -69,19 +69,19 @@ make clean
 
 ## Usage
 
-tokred reads stdin and writes stdout. Statistics are written to stderr.
+tken reads stdin and writes stdout. Statistics are written to stderr.
 
 ```
-./tokred [options] < input.txt
-./tokred [options] --batch <directory>
+./tken [options] < input.txt
+./tken [options] --batch <directory>
 ```
 
 Examples:
 
 ```
-cat prompt.txt | ./tokred --stats
-./tokred --preserve --match "^LOG:" --model 3 --stats < input.txt
-./tokred --batch ./logs --backend gpu --time
+cat prompt.txt | ./tken --stats
+./tken --preserve --match "^LOG:" --model 3 --stats < input.txt
+./tken --batch ./logs --backend gpu --time
 ```
 
 ## Options
@@ -213,4 +213,4 @@ Batches (GPU/CPU):   ... / ...     (with --time)
 ## Version history
 
 - **4.0**: Single source file. Output keeps line structure. `--match` transforms whole lines. `--preserve` checks whole tokens. `--compress` affects only decorative runs. Articles are no longer removed. Cost is priced at the input rate. Batch mode and optional CUDA backend added.
-- **3.0**: Renamed to tken_v3. Multiple tokenizers and pricing models. Earlier versions did not keep line breaks and did not implement batch mode.
+- **3.0**: Renamed to tken. Multiple tokenizers and pricing models. Earlier versions did not keep line breaks and did not implement batch mode.
