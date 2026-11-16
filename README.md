@@ -1,294 +1,216 @@
-# TKEN v3 - Token Reduction Engine
+# tokred - Token Reduction Engine
 
-## Overview
+Version 4.0
 
-Production-grade text compression tool that reduces API token costs by:
-- Removing filler words (very, really, quite, just, basically, etc.)
-- Abbreviating common words (information → info, government → gov, etc.)
-- Collapsing whitespace and duplicate characters
-- Preserving URLs, emails, and code blocks (optional)
+tokred reduces the size of text before it is sent to a large language model. It removes filler words, abbreviates common words, collapses whitespace, and estimates the token count and API cost before and after reduction. It optionally runs on an NVIDIA GPU through CUDA.
 
-Supports 5 different tokenization methods and 11 LLM pricing models with real-time cost calculation.
+tokred changes the text it processes. Always review output before using it for anything where exact wording matters.
 
----
+## Features
 
-## Quick Start
+- Whitespace collapsing that keeps line breaks and leading indentation
+- Removal of filler words: really, very, quite, just, actually, basically
+- Abbreviation of common words: information to info, government to gov, thank you to ty, and others
+- Capping of decorative character runs such as `-----` (optional)
+- Preservation of URLs, email addresses, and backtick code spans (optional)
+- Regex-based line selection with `--match`
+- Batch processing of `.txt`, `.log`, and `.md` files in a directory tree
+- Token estimates and cost calculation for 11 pricing models across five tokenizer families
+- Optional CUDA backend, selected automatically for large batches
 
-### Basic Usage
-```bash
-./tken_v3 --stats < input.txt
-```
+## Requirements
 
-### With Cost Breakdown for Claude Opus 4.8
-```bash
-./tken_v3 --stats --model 3 < input.txt
-```
+- A C11 compiler (GCC or Clang) and POSIX threads
+- For GPU support: an NVIDIA GPU, the CUDA Toolkit (nvcc), and a compatible driver
 
-### Preserve URLs/Code, Use Claude Tokenizer
-```bash
-./tken_v3 --preserve --tokenizer 4 --stats < input.txt
-```
+## Building
 
-### Compare Different Models
-```bash
-for model in 0 1 2 3; do
-  echo "=== Model $model ==="
-  cat input.txt | ./tken_v3 --model $model --stats 2>&1 | grep "Model:\|Money saved:"
-done
-```
-
----
-
-## Tokenization Methods
-
-| ID | Name | Chars/Token | Used By | Notes |
-|----|------|-------------|---------|-------|
-| 0 | GPT-3 | 4.0 | OpenAI GPT-3/3.5 | Default, most common |
-| 1 | WordPiece | 5.0 | BERT, Google models | Balanced approach |
-| 2 | BPE | 4.5 | GPT-2, GPT-4 | Good for code |
-| 3 | SentencePiece | 5.0 | T5, mBART, Gemini | Language-agnostic |
-| 4 | Claude | 3.7 | Anthropic Claude | Most efficient tokenization |
-
-**Claude tokenizer (4) produces the lowest token counts** because it has the lowest chars/token ratio.
-
----
-
-## Supported Pricing Models
+CPU build:
 
 ```
- 0. GPT-4o              $2.50/$10.00 per 1M (input/output)
- 1. GPT-4o mini         $0.15/$0.60 per 1M
- 2. GPT-3.5 Turbo       $0.50/$1.50 per 1M
- 3. Claude Opus 4.8     $5.00/$25.00 per 1M ← Most expensive
- 4. Claude Sonnet 4.6   $3.00/$15.00 per 1M
- 5. Claude Haiku 4.5    $1.00/$5.00 per 1M
- 6. Claude Fable 5      $10.00/$50.00 per 1M ← Premium model
- 7. Gemini 3.1 Pro      $2.00/$12.00 per 1M
- 8. Gemini 2.5 Pro      $1.25/$5.00 per 1M
- 9. Grok 4.1            $0.20/$0.50 per 1M ← Cheapest
-10. Llama 3.1           $0.50/$1.50 per 1M
+make
 ```
 
-Use `--show-models` to display full list dynamically.
+CUDA build. Set `ARCH` to match your GPU:
 
----
+| GPU generation | ARCH |
+|----------------|------|
+| Turing (RTX 20 series, GTX 16 series) | sm_75 |
+| Ampere (RTX 30 series) | sm_86 |
+| Ada Lovelace (RTX 40 series) | sm_89 |
 
-## Cost Savings Examples
-
-### Example 1: Claude Opus (Expensive Model)
 ```
-Input:  "This is a very lengthy document that contains quite a lot of unnecessary filler"
-Output: "This is lengthy document that contains lot of unnecessary filler"
-
-Input tokens:  80
-Output tokens: 57
-Tokens saved:  23 (28.75%)
-
-Cost before: $0.002400
-Cost after:  $0.001825
-Money saved: $0.000575 (23.96%)
+make gpu ARCH=sm_86
 ```
 
-### Example 2: Budget Model (GPT-4o mini)
-Same text compressed:
-- Money saved: $0.00003 per call
-- But at scale (1M calls/day): **$30/day = $900/month saved**
+Both targets can be built side by side. The CUDA build produces `tokred_gpu`.
 
----
+## Testing
 
-## Transformation Examples
+Run the CPU test, which writes a sample run to `cpu.out`:
 
-### Input
 ```
-The government really does provide quite a lot of very valuable information. 
-Please check through the example code. It's basically important because the 
-process is very very complex indeed.
+make test
 ```
 
-### Output (Aggressive Mode)
+Run the CPU and GPU comparison. Both outputs must match byte for byte:
+
 ```
-gov does provide lot of valuable info. pls check thru eg code. It's imp bc 
-process is complex indeed.
-```
-
-**Reduction: 34.72% tokens saved**
-
----
-
-## Advanced Usage
-
-### 1. Selective Transformation (Only LOG lines)
-```bash
-cat access.log | ./tken_v3 --match "^LOG:" --stats
+make test-gpu ARCH=sm_86
 ```
 
-### 2. Preserve URLs/Code
-```bash
-./tken_v3 --preserve --stats < code_with_docs.txt
+If the outputs differ, the host and device paths disagree. Do not rely on GPU output until this check passes.
+
+Remove build products and test files:
+
 ```
-This won't abbreviate words inside URLs or code blocks.
-
-### 3. Custom Tokenizer + Model Combo
-```bash
-# BPE tokenization with Grok (cheapest) pricing
-./tken_v3 --tokenizer 2 --model 9 --stats < input.txt
-
-# Claude tokenization with Claude Fable (most expensive)
-./tken_v3 --tokenizer 4 --model 6 --stats < input.txt
+make clean
 ```
 
-### 4. Timing Analysis
-```bash
-./tken_v3 --time --stats < large_file.txt
+## Usage
+
+tokred reads stdin and writes stdout. Statistics are written to stderr.
+
 ```
-Shows:
-- Processing time in milliseconds
-- Throughput (characters/second)
-- All cost breakdowns
+./tokred [options] < input.txt
+./tokred [options] --batch <directory>
+```
 
----
+Examples:
 
-## Statistics Output Breakdown
+```
+cat prompt.txt | ./tokred --stats
+./tokred --preserve --match "^LOG:" --model 3 --stats < input.txt
+./tokred --batch ./logs --backend gpu --time
+```
+
+## Options
+
+### Transformations
+
+If no transformation flag is given, `--aggressive` is used.
+
+| Flag | Effect |
+|------|--------|
+| `--ws` | Collapse runs of whitespace to one space. Line breaks and leading indentation are kept. |
+| `--filler` | Remove the words really, very, quite, just, actually, and basically. |
+| `--abbr` | Replace common words with abbreviations (see the table below). |
+| `--compress` | Reduce runs of four or more of `- = _ * # ~` to three characters. Other text is not changed. |
+| `--aggressive` | Equivalent to `--ws --filler --abbr`. |
+
+Abbreviations:
+
+| Full | Abbreviation | Full | Abbreviation |
+|------|--------------|------|--------------|
+| information | info | through | thru |
+| government | gov | example | eg |
+| please | pls | important | imp |
+| thank you | ty | different | diff |
+| because | bc | community | comm |
+
+Matching is case-insensitive and applies only to whole words.
+
+### Filtering
+
+| Flag | Effect |
+|------|--------|
+| `--preserve` | Leave URLs, `www.` addresses, email addresses, and text inside backtick code spans unchanged. |
+| `--match <regex>` | Transform only lines that match the extended regular expression. Matching is case-insensitive. Other lines pass through unchanged. |
+
+### Execution
+
+| Flag | Effect |
+|------|--------|
+| `--backend cpu` | Use the CPU only. |
+| `--backend gpu` | Use the GPU for every batch. The program exits if no CUDA device is available. |
+| `--backend auto` | Default. Use the GPU for batches of 4 MB or more and the CPU otherwise. |
+| `--threads <n>` | Number of CPU worker threads, from 1 to 64. Default 4. |
+| `--batch <dir>` | Process every `.txt`, `.log`, and `.md` file under `<dir>` recursively. Each output is written beside its input as `<name>.reduced`. |
+
+### Cost estimate
+
+| Flag | Effect |
+|------|--------|
+| `--tokenizer <n>` | Tokenizer used for the token estimate. See the table below. Default 0. |
+| `--model <n>` | Pricing model used for the cost estimate. Default 0. |
+| `--show-models` | List the pricing models with their indexes. |
+| `--stats` | Print statistics to stderr. |
+| `--time` | Print statistics plus transform time, throughput, and the number of GPU and CPU batches. |
+| `-h`, `--help` | Show help. |
+
+Tokenizers:
+
+| Index | Name | Characters per token used for estimate |
+|-------|------|----------------------------------------|
+| 0 | GPT-3 | 4.0 |
+| 1 | WordPiece | 5.0 |
+| 2 | BPE | 4.5 |
+| 3 | SentencePiece | 5.0 |
+| 4 | Claude | 3.7 |
+
+Pricing models:
+
+| Index | Model | Input per 1M tokens | Output per 1M tokens |
+|-------|-------|---------------------|----------------------|
+| 0 | GPT-4o | $2.50 | $10.00 |
+| 1 | GPT-4o mini | $0.15 | $0.60 |
+| 2 | GPT-3.5 Turbo | $0.50 | $1.50 |
+| 3 | Claude Opus 4.8 | $5.00 | $25.00 |
+| 4 | Claude Sonnet 4.6 | $3.00 | $15.00 |
+| 5 | Claude Haiku 4.5 | $1.00 | $5.00 |
+| 6 | Claude Fable 5 | $10.00 | $50.00 |
+| 7 | Gemini 3.1 Pro | $2.00 | $12.00 |
+| 8 | Gemini 2.5 Pro | $1.25 | $5.00 |
+| 9 | Grok 4.1 | $0.20 | $0.50 |
+| 10 | Llama 3.1 | $0.50 | $1.50 |
+
+Prices must be verified against each vendor's current pricing page before the cost output is used for decisions. Use `--show-models` to list the indexes.
+
+## How cost is calculated
+
+Token counts are estimated from byte counts divided by the characters-per-token value of the selected tokenizer. They are not exact tokenizer output. Prompt tokens are billed at the model's input rate, so the reduction is priced at the input rate only:
+
+```
+cost_before = input_tokens / 1,000,000 * input_price
+cost_after  = output_tokens / 1,000,000 * input_price
+```
+
+## Statistics output
 
 ```
 ========== COMPRESSION STATISTICS ==========
 Model:               Claude Opus 4.8 (anthropic)
-Tokenizer:           Claude (char/token: 3.7)
-Lines processed:     1
-Input tokens:        80
-Output tokens:       57
-Tokens saved:        23 (28.75%)
-Compression ratio:   71.25%          ← Output is 71% of original size
-Cost before:         $0.002400       ← What you would pay without compression
-Cost after:          $0.001825       ← What you pay with compression
-Money saved:         $0.000575 (23.96%)  ← Actual savings
-Processing time:     5.27 ms
-Throughput:          40 chars/sec
+Tokenizer:           Claude (3.7 chars/token)
+Lines processed:     ...
+Input bytes:         ...
+Output bytes:        ...
+Est. input tokens:   ...
+Est. output tokens:  ...
+Tokens saved:        ... (...%)
+Cost before:         $...
+Cost after:          $...
+Money saved:         $... (...%)
+Transform time:      ... ms        (with --time)
+Throughput:          ... MB/s      (with --time)
+Batches (GPU/CPU):   ... / ...     (with --time)
 ============================================
 ```
 
----
+## Performance
 
-## Performance Characteristics
-
-- **Parallelism**: 4 worker threads by default
-- **Max line size**: 65KB (BUFFER_SIZE)
-- **Buffer multiplication**: 4x for output (safety margin)
-- **Throughput**: ~40-100 chars/sec depending on CPU
-- **Memory**: ~256KB per worker thread
-
-For large files (100MB+), throughput is sustained around 50-80 chars/sec per thread.
-
----
-
-## Transformation Flags Explained
-
-| Flag | What It Does | Example |
-|------|--------------|---------|
-| `--ws` | Collapse multiple spaces into one | `"a    b"` → `"a b"` |
-| `--filler` | Remove common filler words | `"very important"` → `"important"` |
-| `--compress` | Collapse duplicate chars | `"aaa"` → `"a"`, `"!!!"` → `"!"` |
-| `--abbr` | Abbreviate common words | `"information"` → `"info"` |
-| `--aggressive` | Enable all (DEFAULT if no flags given) | All of above |
-| `--preserve` | Skip URLs/emails/code | `"https://x.com"` untouched |
-
----
-
-## Real-World Scenarios
-
-### Scenario 1: Prompt Compression for LLM Chains
-**Use case**: Passing retrieved documents through Claude
-
-```bash
-cat retrieved_docs.txt | ./tken_v3 --preserve --model 4 --stats > compressed_docs.txt
-```
-
-**Benefit**: Keep document semantics intact (preserve URLs), reduce output tokens by 25-35%
-
-### Scenario 2: Log Aggregation Cost Reduction
-**Use case**: Sending logs to Fable 5 model for analysis
-
-```bash
-tail -f access.log | ./tken_v3 --match "ERROR|WARN" --model 6 --stats
-```
-
-**Benefit**: Only compress ERROR/WARN lines, save money on high-volume log processing
-
-### Scenario 3: Multi-Model Cost Comparison
-**Use case**: Deciding which model to use
-
-```bash
-for model in {0..10}; do
-  echo "Model $model:"
-  cat budget.txt | ./tken_v3 --model $model --stats 2>&1 | grep "Money saved:"
-done
-```
-
----
-
-## Batch Mode (Planned)
-
-```bash
-./tken_v3 --batch /var/logs/ --model 2 --stats
-```
-
-Processes all `.txt`, `.log`, `.md` files recursively with cumulative statistics.
-
----
-
-## Building from Source
-
-```bash
-gcc -Wall -Wextra -O2 -pthread tken_v3_full.c -o tken_v3
-```
-
-Requirements:
-- GCC or Clang
-- POSIX threads (pthread)
-- Standard C library (libc)
-
----
-
-## Tips & Tricks
-
-1. **Test with --preserve first** to ensure code/URLs aren't broken
-2. **Use --model 9 (Grok) pricing** for cost baseline comparisons
-3. **Combine tokenizers** to find the best fit for your text type
-4. **Redirect stderr for stats**: `./tken_v3 --stats < in.txt 2> stats.txt`
-5. **Preserve before compress**: `--preserve --abbr --filler` is safer than `--aggressive`
-
----
+- The CPU backend splits each batch across worker threads.
+- The GPU backend runs one thread per line. Host-to-device copies have a fixed cost, so the GPU is only faster for large batches. Use `--time` to compare the two backends on your own data before choosing one.
+- Batches hold up to 8192 lines or 8 MB of input, whichever comes first. Lines of any length are accepted.
 
 ## Limitations
 
-- Lines longer than 65KB will be truncated (rare for normal text)
-- No reversibility by default (transformations are lossy)
-- Abbreviations are hardcoded (no custom dictionary yet)
-- Regex pattern matching doesn't preserve match groups
-- Batch mode not yet implemented (stub present)
+- Transformations are lossy. The original text cannot be recovered from the output.
+- Token counts are estimates based on character counts, not real tokenizer output.
+- Abbreviations and filler words are fixed. There is no custom dictionary yet.
+- `--match` decides per line. It does not transform only part of a line.
+- The GPU backend has not been benchmarked on all hardware. Verify output with `make test-gpu` before use.
 
----
+## Version history
 
-## FAQ
-
-**Q: Which tokenizer should I use?**
-A: Use Claude (4) for lowest token counts. Use GPT-3 (0) if using OpenAI models.
-
-**Q: How much money can I save?**
-A: 25-35% token reduction is typical. At scale:
-- 1M API calls/day with Fable 5: **$250-350/day** saved
-- 100K calls/day with Claude Opus: **$25-35/day** saved
-
-**Q: Should I use --preserve?**
-A: Yes, unless you're processing plain text without URLs/code/emails.
-
-**Q: Can I use this in production?**
-A: Yes. It's production-grade with proper error handling, thread safety, and bounded memory.
-
----
-
-## Version History
-
-- **v3.0** (Current): Multiple tokenizers, 11 models, pricing, comprehensive help
-- **v2.0**: Token counting, stats, semantic preservation
-- **v1.0**: Basic text transformations
+- **4.0**: Single source file. Output keeps line structure. `--match` transforms whole lines. `--preserve` checks whole tokens. `--compress` affects only decorative runs. Articles are no longer removed. Cost is priced at the input rate. Batch mode and optional CUDA backend added.
+- **3.0**: Renamed to tken_v3. Multiple tokenizers and pricing models. Earlier versions did not keep line breaks and did not implement batch mode.
