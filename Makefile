@@ -5,9 +5,9 @@ CFLAGS     ?= -O3 -std=c11 -Wall -Wextra -pedantic
 NVCCFLAGS  ?= -O3 -arch=$(ARCH) -DUSE_CUDA -x cu -Xcompiler -pthread
 LDLIBS     = -lpthread
 
-SRC        = tokred.c
-CPU_BIN    = tokred
-GPU_BIN    = tokred_gpu
+SRC        = tken.c
+CPU_BIN    = tken
+GPU_BIN    = tken_gpu
 
 .PHONY: all cpu gpu test test-cpu test-gpu clean
 
