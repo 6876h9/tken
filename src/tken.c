@@ -1,714 +1,836 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <dirent.h>
+#include <errno.h>
+#include <pthread.h>
+#include <regex.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <stdbool.h>
-#include <pthread.h>
-#include <regex.h>
-#include <unistd.h>
-#include <time.h>
-#include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
 
-#define BUFFER_SIZE 65536
-#define MAX_OUTPUT_SIZE (BUFFER_SIZE * 4)
-#define QUEUE_SIZE 128
-#define DEFAULT_NUM_WORKERS 4
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
-typedef enum {
-    MODE_WS         = 1 << 0,
-    MODE_FILLER     = 1 << 1,
-    MODE_COMPRESS   = 1 << 2,
-    MODE_ABBR       = 1 << 3,
+#ifdef __CUDACC__
+#define HD __host__ __device__
+#else
+#define HD
+#endif
+
+#define VERSION          "4.0"
+#define BATCH_MAX_LINES  8192
+#define BATCH_MAX_BYTES  (8u * 1024u * 1024u)
+#define GPU_MIN_BYTES    (4u * 1024u * 1024u)
+#define MAX_THREADS      64
+#define DEFAULT_THREADS  4
+#define PATH_BUF         4096
+#define MAX_RULES        16
+#define RULE_TEXT        24
+
+enum {
+    MODE_WS         = 1u << 0,
+    MODE_FILLER     = 1u << 1,
+    MODE_COMPRESS   = 1u << 2,
+    MODE_ABBR       = 1u << 3,
     MODE_AGGRESSIVE = MODE_WS | MODE_FILLER | MODE_ABBR
-} ProcessingMode;
-
-typedef enum {
-    CONTEXT_NORMAL = 0,
-    CONTEXT_URL = 1,
-    CONTEXT_CODE = 2,
-    CONTEXT_EMAIL = 3
-} TextContext;
-
-typedef enum {
-    TOKEN_GPT3 = 0,        /* GPT-3/GPT-3.5: ~4 chars = 1 token */
-    TOKEN_WORDPIECE = 1,   /* BERT/WordPiece: ~5 chars = 1 token */
-    TOKEN_BPE = 2,         /* GPT-2/BPE: ~4.5 chars = 1 token */
-    TOKEN_SENTENCEPIECE = 3, /* Gemini/SentencePiece: ~5 chars = 1 token */
-    TOKEN_CLAUDE = 4       /* Claude: ~3.7 chars = 1 token */
-} TokenizerType;
-
-typedef struct {
-    const char *name;
-    const char *model_family;
-    double input_price_per_mtok;   /* Per million tokens */
-    double output_price_per_mtok;
-    int token_ratio;               /* chars per 1 token * 100 */
-} PricingModel;
-
-typedef struct {
-    const char *full;
-    const char *abbr;
-    size_t len;
-    int cost_saving;
-} AbbrevPair;
-
-typedef struct {
-    unsigned long input_tokens;
-    unsigned long output_tokens;
-    unsigned long lines_processed;
-    double compression_ratio;
-    double processing_time_ms;
-    double savings_usd;
-} CompressionStats;
-
-static const char *FILLERS[] = {
-    "really", "very", "quite", "just", "actually", "basically", "the", "a", "an"
 };
-#define FILLER_COUNT (sizeof(FILLERS) / sizeof(FILLERS[0]))
-
-static const AbbrevPair ABBREVS[] = {
-    {"information", "info", 11, 1},
-    {"government", "gov", 10, 1},
-    {"please", "pls", 6, 1},
-    {"thank you", "ty", 9, 2},
-    {"because", "bc", 7, 1},
-    {"through", "thru", 7, 1},
-    {"example", "eg", 7, 1},
-    {"important", "imp", 9, 1},
-    {"different", "diff", 9, 1},
-    {"community", "comm", 9, 1}
-};
-#define ABBREV_COUNT (sizeof(ABBREVS) / sizeof(ABBREVS[0]))
-
-static const PricingModel MODELS[] = {
-    /* OpenAI models */
-    {"GPT-4o", "openai", 2.50, 10.00, 375},        /* ~2.67 chars per token */
-    {"GPT-4o mini", "openai", 0.15, 0.60, 625},    /* ~6.25 chars per token */
-    {"GPT-3.5 Turbo", "openai", 0.50, 1.50, 400},  /* ~4 chars per token */
-    
-    /* Claude models */
-    {"Claude Opus 4.8", "anthropic", 5.00, 25.00, 270}, /* ~3.7 chars per token */
-    {"Claude Sonnet 4.6", "anthropic", 3.00, 15.00, 270},
-    {"Claude Haiku 4.5", "anthropic", 1.00, 5.00, 270},
-    {"Claude Fable 5", "anthropic", 10.00, 50.00, 270},
-    
-    /* Google models */
-    {"Gemini 3.1 Pro", "google", 2.00, 12.00, 500},    /* ~5 chars per token */
-    {"Gemini 2.5 Pro", "google", 1.25, 5.00, 500},
-    
-    /* xAI models */
-    {"Grok 4.1", "xai", 0.20, 0.50, 500},
-    
-    /* Meta/Llama via API */
-    {"Llama 3.1", "meta", 0.50, 1.50, 400}
-};
-#define MODEL_COUNT (sizeof(MODELS) / sizeof(MODELS[0]))
 
 typedef struct {
-    char *data;
-    char *output;
-    unsigned long sequence_id;
-} JobPacket;
+    char full[RULE_TEXT];
+    char abbr[RULE_TEXT];
+    unsigned char full_len;
+    unsigned char abbr_len;
+} Rule;
 
 typedef struct {
-    JobPacket slots[QUEUE_SIZE];
-    int head;
-    int tail;
-    int count;
-    bool finished;
-    pthread_mutex_t lock;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-} WorkQueue;
+    Rule abbrs[MAX_RULES];
+    Rule fillers[MAX_RULES];
+    int n_abbrs;
+    int n_fillers;
+} RuleSet;
 
-typedef struct {
-    int active_flags;
-    bool has_regex;
-    bool stats_mode;
-    bool preserve_semantics;
-    bool time_mode;
-    int tokenizer_type;
-    int pricing_model_idx;
-    bool batch_mode;
-    char batch_dir[256];
-    regex_t match_regex;
-    WorkQueue queue;
-    pthread_mutex_t output_lock;
-    pthread_mutex_t stats_lock;
-    CompressionStats stats;
-    unsigned long next_output_seq;
-} EngineConfig;
-
-static EngineConfig config;
-
-static unsigned long estimate_tokens_gpt3(const char *text) {
-    if (!text) return 0;
-    return (strlen(text) * 100) / 400;
+HD static inline int ch_is_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
 }
 
-static unsigned long estimate_tokens_wordpiece(const char *text) {
-    if (!text) return 0;
-    return (strlen(text) * 100) / 500;
+HD static inline int ch_is_alnum(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-static unsigned long estimate_tokens_bpe(const char *text) {
-    if (!text) return 0;
-    return (strlen(text) * 100) / 450;
+HD static inline unsigned char ch_lower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
 }
 
-static unsigned long estimate_tokens_sentencepiece(const char *text) {
-    if (!text) return 0;
-    return (strlen(text) * 100) / 500;
+HD static inline int is_decor(unsigned char c) {
+    return c == '-' || c == '=' || c == '_' || c == '*' || c == '#' || c == '~';
 }
 
-static unsigned long estimate_tokens_claude(const char *text) {
-    if (!text) return 0;
-    return (strlen(text) * 100) / 370;
-}
-
-static unsigned long estimate_tokens(const char *text, int tokenizer_type) {
-    switch (tokenizer_type) {
-        case TOKEN_WORDPIECE: return estimate_tokens_wordpiece(text);
-        case TOKEN_BPE: return estimate_tokens_bpe(text);
-        case TOKEN_SENTENCEPIECE: return estimate_tokens_sentencepiece(text);
-        case TOKEN_CLAUDE: return estimate_tokens_claude(text);
-        case TOKEN_GPT3:
-        default: return estimate_tokens_gpt3(text);
+HD static inline int match_ci(const char *s, size_t n, size_t pos,
+                              const char *word, size_t wlen) {
+    if (pos + wlen > n) return 0;
+    for (size_t k = 0; k < wlen; k++) {
+        if (ch_lower((unsigned char)s[pos + k]) != (unsigned char)word[k]) return 0;
     }
+    return 1;
 }
 
-static TextContext detect_context(const char *text, size_t pos) {
-    if (!text || pos == 0) return CONTEXT_NORMAL;
-
-    if (pos > 4) {
-        const char *check = &text[pos >= 10 ? pos - 10 : 0];
-        if (strstr(check, "http://") || strstr(check, "https://") || 
-            strstr(check, "ftp://") || strstr(check, "www.")) {
-            return CONTEXT_URL;
-        }
-    }
-
-    if (pos > 0 && (text[pos - 1] == '`' || text[pos - 1] == '{' || 
-                    text[pos - 1] == '[' || text[pos - 1] == '(')) {
-        return CONTEXT_CODE;
-    }
-
-    if (pos > 0 && text[pos - 1] == '@') {
-        return CONTEXT_EMAIL;
-    }
-
-    return CONTEXT_NORMAL;
+HD static inline int bound_ok(const char *s, size_t n, size_t pos, size_t len) {
+    if (pos > 0 && ch_is_alnum((unsigned char)s[pos - 1])) return 0;
+    if (pos + len < n && ch_is_alnum((unsigned char)s[pos + len])) return 0;
+    return 1;
 }
 
-static inline bool is_valid_bound(const char *base, const char *start, size_t match_len) {
-    if (start < base) return false;
-    bool left_ok = (start == base) || !isalnum((unsigned char)*(start - 1));
-    bool right_ok = !isalnum((unsigned char)*(start + match_len));
-    return left_ok && right_ok;
+HD static inline int token_is_special(const char *s, size_t start, size_t end) {
+    if (end - start >= 4 &&
+        ch_lower((unsigned char)s[start]) == 'w' &&
+        ch_lower((unsigned char)s[start + 1]) == 'w' &&
+        ch_lower((unsigned char)s[start + 2]) == 'w' &&
+        s[start + 3] == '.') {
+        return 1;
+    }
+    for (size_t k = start; k < end; k++) {
+        if (s[k] == '@') return 1;
+        if (s[k] == ':' && k + 2 < end && s[k + 1] == '/' && s[k + 2] == '/') return 1;
+    }
+    return 0;
 }
 
-static int transform_segment(const char *src, char *dst, size_t dst_size, int flags) {
-    if (!src || !dst || dst_size < 2) return -1;
-    
-    size_t i = 0, j = 0;
-    bool in_whitespace = false;
+HD static inline size_t transform_line(const char *src, size_t n, char *dst,
+                                       unsigned flags, int preserve,
+                                       const RuleSet *rs) {
+    size_t i = 0, o = 0;
+    int pending = 0;
+    int emitted = 0;
+    int in_code = 0;
 
-    while (src[i] != '\0' && j < dst_size - 1) {
-        if ((flags & MODE_COMPRESS) && src[i + 1] == src[i] && !isspace((unsigned char)src[i])) {
+#define FLUSH() do { if (pending && emitted) dst[o++] = ' '; pending = 0; } while (0)
+
+    while (i < n) {
+        unsigned char c = (unsigned char)src[i];
+
+        if (in_code) {
+            if (c == '`') in_code = 0;
+            dst[o++] = (char)c;
             i++;
             continue;
         }
 
-        if (flags & MODE_WS) {
-            if (isspace((unsigned char)src[i])) {
-                if (!in_whitespace && j < dst_size - 1) {
-                    dst[j++] = ' ';
-                    in_whitespace = true;
-                }
-                i++;
-                continue;
-            }
-            in_whitespace = false;
+        if (preserve && c == '`') {
+            FLUSH();
+            in_code = 1;
+            dst[o++] = '`';
+            emitted = 1;
+            i++;
+            continue;
         }
 
-        if ((flags & (MODE_FILLER | MODE_ABBR)) && ((i == 0) || !isalnum((unsigned char)src[i - 1]))) {
-            TextContext ctx = config.preserve_semantics ? detect_context(src, i) : CONTEXT_NORMAL;
-            
-            if (ctx != CONTEXT_NORMAL) {
-                if (j >= dst_size - 1) return -1;
-                dst[j++] = src[i++];
+        if (ch_is_space(c)) {
+            if ((flags & MODE_WS) && emitted) {
+                pending = 1;
+            } else {
+                dst[o++] = (char)c;
+            }
+            i++;
+            continue;
+        }
+
+        if (preserve && (i == 0 || ch_is_space((unsigned char)src[i - 1]))) {
+            size_t end = i;
+            while (end < n && !ch_is_space((unsigned char)src[end])) end++;
+            if (token_is_special(src, i, end)) {
+                FLUSH();
+                memcpy(dst + o, src + i, end - i);
+                o += end - i;
+                i = end;
+                emitted = 1;
                 continue;
             }
+        }
 
-            bool matched = false;
+        if ((flags & MODE_COMPRESS) && is_decor(c)) {
+            size_t run = 1;
+            while (i + run < n && (unsigned char)src[i + run] == c) run++;
+            size_t keep = run > 3 ? 3 : run;
+            FLUSH();
+            for (size_t k = 0; k < keep; k++) dst[o++] = (char)c;
+            emitted = 1;
+            i += run;
+            continue;
+        }
+
+        if ((flags & (MODE_ABBR | MODE_FILLER)) && ch_is_alnum(c) &&
+            (i == 0 || !ch_is_alnum((unsigned char)src[i - 1]))) {
+            int done = 0;
 
             if (flags & MODE_ABBR) {
-                for (size_t k = 0; k < ABBREV_COUNT; k++) {
-                    if (strncasecmp(&src[i], ABBREVS[k].full, ABBREVS[k].len) == 0 &&
-                        is_valid_bound(src, &src[i], ABBREVS[k].len)) {
-                        size_t abbr_len = strlen(ABBREVS[k].abbr);
-                        if (j + abbr_len >= dst_size - 1) return -1;
-                        memcpy(&dst[j], ABBREVS[k].abbr, abbr_len);
-                        j += abbr_len;
-                        i += ABBREVS[k].len;
-                        matched = true;
-                        break;
+                for (int k = 0; k < rs->n_abbrs && !done; k++) {
+                    const Rule *r = &rs->abbrs[k];
+                    if (match_ci(src, n, i, r->full, r->full_len) &&
+                        bound_ok(src, n, i, r->full_len)) {
+                        FLUSH();
+                        for (unsigned m = 0; m < r->abbr_len; m++) dst[o++] = r->abbr[m];
+                        i += r->full_len;
+                        emitted = 1;
+                        done = 1;
                     }
                 }
             }
 
-            if (!matched && (flags & MODE_FILLER)) {
-                for (size_t k = 0; k < FILLER_COUNT; k++) {
-                    size_t filler_len = strlen(FILLERS[k]);
-                    if (strncasecmp(&src[i], FILLERS[k], filler_len) == 0 &&
-                        is_valid_bound(src, &src[i], filler_len)) {
-                        i += filler_len;
-                        if (isspace((unsigned char)src[i]) && (flags & MODE_WS)) {
-                            i++;
-                        }
-                        matched = true;
-                        break;
+            if (!done && (flags & MODE_FILLER)) {
+                for (int k = 0; k < rs->n_fillers && !done; k++) {
+                    const Rule *r = &rs->fillers[k];
+                    if (match_ci(src, n, i, r->full, r->full_len) &&
+                        bound_ok(src, n, i, r->full_len)) {
+                        i += r->full_len;
+                        if (!(flags & MODE_WS) && i < n && (src[i] == ' ' || src[i] == '\t')) i++;
+                        done = 1;
                     }
                 }
             }
-            if (matched) continue;
+
+            if (done) continue;
         }
 
-        if (j >= dst_size - 1) return -1;
-        dst[j++] = src[i++];
+        FLUSH();
+        dst[o++] = (char)c;
+        emitted = 1;
+        i++;
     }
 
-    dst[j] = '\0';
-    return (src[i] == '\0') ? 0 : -1;
+#undef FLUSH
+    return o;
 }
 
-static int process_line(const char *src, char *dst, size_t dst_size, int flags) {
-    if (!src || !dst || dst_size < 2) return -1;
+static void set_rule(Rule *r, const char *full, const char *abbr) {
+    size_t fl = strlen(full);
+    size_t al = abbr ? strlen(abbr) : 0;
+    memset(r, 0, sizeof *r);
+    memcpy(r->full, full, fl);
+    r->full_len = (unsigned char)fl;
+    if (abbr) {
+        memcpy(r->abbr, abbr, al);
+        r->abbr_len = (unsigned char)al;
+    }
+}
 
-    if (!config.has_regex) {
-        return transform_segment(src, dst, dst_size, flags);
+static void ruleset_init(RuleSet *rs) {
+    static const char *const abbr_pairs[][2] = {
+        {"information", "info"}, {"government", "gov"}, {"please", "pls"},
+        {"thank you", "ty"}, {"because", "bc"}, {"through", "thru"},
+        {"example", "eg"}, {"important", "imp"}, {"different", "diff"},
+        {"community", "comm"}
+    };
+    static const char *const fillers[] = {
+        "really", "very", "quite", "just", "actually", "basically"
+    };
+
+    memset(rs, 0, sizeof *rs);
+    for (size_t k = 0; k < sizeof abbr_pairs / sizeof abbr_pairs[0] && k < MAX_RULES; k++) {
+        set_rule(&rs->abbrs[k], abbr_pairs[k][0], abbr_pairs[k][1]);
+        rs->n_abbrs++;
+    }
+    for (size_t k = 0; k < sizeof fillers / sizeof fillers[0] && k < MAX_RULES; k++) {
+        set_rule(&rs->fillers[k], fillers[k], NULL);
+        rs->n_fillers++;
+    }
+}
+
+typedef enum { BACKEND_CPU = 0, BACKEND_GPU = 1, BACKEND_AUTO = 2 } Backend;
+
+typedef enum {
+    TOKEN_GPT3, TOKEN_WORDPIECE, TOKEN_BPE, TOKEN_SENTENCEPIECE, TOKEN_CLAUDE, TOKEN_COUNT
+} TokenizerType;
+
+static const char *const TOKENIZER_NAMES[TOKEN_COUNT] = {
+    "GPT-3 (4.0 chars/token)", "WordPiece (5.0 chars/token)", "BPE (4.5 chars/token)",
+    "SentencePiece (5.0 chars/token)", "Claude (3.7 chars/token)"
+};
+static const double CHARS_PER_TOKEN[TOKEN_COUNT] = {4.0, 5.0, 4.5, 5.0, 3.7};
+
+typedef struct {
+    const char *name;
+    const char *family;
+    double input_per_mtok;
+    double output_per_mtok;
+} PricingModel;
+
+static const PricingModel MODELS[] = {
+    {"GPT-4o",            "openai",    2.50, 10.00},
+    {"GPT-4o mini",       "openai",    0.15,  0.60},
+    {"GPT-3.5 Turbo",     "openai",    0.50,  1.50},
+    {"Claude Opus 4.8",   "anthropic", 5.00, 25.00},
+    {"Claude Sonnet 4.6", "anthropic", 3.00, 15.00},
+    {"Claude Haiku 4.5",  "anthropic", 1.00,  5.00},
+    {"Claude Fable 5",    "anthropic",10.00, 50.00},
+    {"Gemini 3.1 Pro",    "google",    2.00, 12.00},
+    {"Gemini 2.5 Pro",    "google",    1.25,  5.00},
+    {"Grok 4.1",          "xai",       0.20,  0.50},
+    {"Llama 3.1",         "meta",      0.50,  1.50},
+};
+#define MODEL_COUNT (sizeof MODELS / sizeof MODELS[0])
+
+typedef struct {
+    char *in;
+    char *out;
+    size_t *off;
+    size_t *len;
+    size_t *out_len;
+    unsigned char *mask;
+    size_t count;
+    size_t bytes;
+    size_t cap_bytes;
+} Batch;
+
+typedef struct {
+    unsigned flags;
+    int preserve;
+    RuleSet rules;
+
+    int has_regex;
+    regex_t re;
+
+    Backend backend;
+    int threads;
+    int gpu_ready;
+
+    int tokenizer;
+    int model_idx;
+    int stats_on;
+    int time_on;
+
+    unsigned long long in_bytes;
+    unsigned long long out_bytes;
+    unsigned long long lines;
+    unsigned long gpu_batches;
+    unsigned long cpu_batches;
+    double tx_ms;
+} Ctx;
+
+static void die(const char *msg) {
+    fprintf(stderr, "Fatal: %s\n", msg);
+    exit(1);
+}
+
+static int batch_init(Batch *b) {
+    memset(b, 0, sizeof *b);
+    b->off     = (size_t *)malloc(BATCH_MAX_LINES * sizeof(size_t));
+    b->len     = (size_t *)malloc(BATCH_MAX_LINES * sizeof(size_t));
+    b->out_len = (size_t *)malloc(BATCH_MAX_LINES * sizeof(size_t));
+    b->mask    = (unsigned char *)malloc(BATCH_MAX_LINES);
+    b->cap_bytes = 1u << 20;
+    b->in  = (char *)malloc(b->cap_bytes);
+    b->out = (char *)malloc(b->cap_bytes);
+    if (!b->off || !b->len || !b->out_len || !b->mask || !b->in || !b->out) return -1;
+    return 0;
+}
+
+static void batch_free(Batch *b) {
+    free(b->in);
+    free(b->out);
+    free(b->off);
+    free(b->len);
+    free(b->out_len);
+    free(b->mask);
+    memset(b, 0, sizeof *b);
+}
+
+static int batch_grow(Batch *b, size_t need) {
+    if (need <= b->cap_bytes) return 0;
+    size_t nc = b->cap_bytes;
+    while (nc < need) nc *= 2;
+    char *ni = (char *)realloc(b->in, nc);
+    if (!ni) return -1;
+    b->in = ni;
+    char *no = (char *)realloc(b->out, nc);
+    if (!no) return -1;
+    b->out = no;
+    b->cap_bytes = nc;
+    return 0;
+}
+
+static size_t read_batch(FILE *fp, Batch *b) {
+    static char *line = NULL;
+    static size_t cap = 0;
+    b->count = 0;
+    b->bytes = 0;
+
+    while (b->count < BATCH_MAX_LINES && b->bytes < BATCH_MAX_BYTES) {
+        ssize_t r = getline(&line, &cap, fp);
+        if (r < 0) break;
+        size_t n = (size_t)r;
+        if (n && line[n - 1] == '\n') n--;
+        if (n && line[n - 1] == '\r') n--;
+
+        if (batch_grow(b, b->bytes + n + 1) != 0) die("out of memory");
+        memcpy(b->in + b->bytes, line, n);
+        b->in[b->bytes + n] = '\0';
+        b->off[b->count] = b->bytes;
+        b->len[b->count] = n;
+        b->bytes += n + 1;
+        b->count++;
+    }
+    return b->count;
+}
+
+static void compute_mask(Ctx *c, Batch *b) {
+    for (size_t i = 0; i < b->count; i++) {
+        if (!c->has_regex) {
+            b->mask[i] = 1;
+        } else {
+            b->mask[i] = (regexec(&c->re, b->in + b->off[i], 0, NULL, 0) == 0);
+        }
+    }
+}
+
+typedef struct {
+    Ctx *c;
+    Batch *b;
+    size_t start;
+    size_t end;
+} CpuSlice;
+
+static void *cpu_slice(void *arg) {
+    CpuSlice *s = (CpuSlice *)arg;
+    Batch *b = s->b;
+    for (size_t i = s->start; i < s->end; i++) {
+        if (!b->mask[i]) {
+            memcpy(b->out + b->off[i], b->in + b->off[i], b->len[i]);
+            b->out_len[i] = b->len[i];
+        } else {
+            b->out_len[i] = transform_line(b->in + b->off[i], b->len[i],
+                                           b->out + b->off[i], s->c->flags,
+                                           s->c->preserve, &s->c->rules);
+        }
+    }
+    return NULL;
+}
+
+static void transform_cpu(Ctx *c, Batch *b) {
+    size_t nt = (size_t)c->threads;
+    if (nt > b->count) nt = b->count;
+    if (nt <= 1) {
+        CpuSlice s = {c, b, 0, b->count};
+        cpu_slice(&s);
+        return;
     }
 
-    regmatch_t pmatch;
-    size_t src_offset = 0;
-    size_t dst_offset = 0;
+    pthread_t th[MAX_THREADS];
+    CpuSlice sl[MAX_THREADS];
+    size_t chunk = (b->count + nt - 1) / nt;
 
-    while (regexec(&config.match_regex, src + src_offset, 1, &pmatch, 0) == 0) {
-        size_t match_start = src_offset + pmatch.rm_so;
-        size_t match_end = src_offset + pmatch.rm_eo;
-        size_t match_len = match_end - match_start;
+    for (size_t t = 0; t < nt; t++) {
+        size_t s0 = t * chunk;
+        size_t e0 = s0 + chunk;
+        if (s0 > b->count) s0 = b->count;
+        if (e0 > b->count) e0 = b->count;
+        sl[t].c = c;
+        sl[t].b = b;
+        sl[t].start = s0;
+        sl[t].end = e0;
+        if (pthread_create(&th[t], NULL, cpu_slice, &sl[t]) != 0) die("pthread_create failed");
+    }
+    for (size_t t = 0; t < nt; t++) pthread_join(th[t], NULL);
+}
 
-        size_t static_len = match_start - src_offset;
-        
-        if (dst_offset + static_len >= dst_size) return -1;
-        memcpy(dst + dst_offset, src + src_offset, static_len);
-        dst_offset += static_len;
+#ifdef USE_CUDA
 
-        char *matched_segment = malloc(match_len + 1);
-        if (!matched_segment) return -1;
-        
-        memcpy(matched_segment, src + match_start, match_len);
-        matched_segment[match_len] = '\0';
+typedef struct {
+    void *ptr;
+    size_t cap;
+} DevBuf;
 
-        size_t tx_buf_size = match_len * 4 + 1;
-        char *transformed_segment = malloc(tx_buf_size);
-        if (!transformed_segment) {
-            free(matched_segment);
-            return -1;
-        }
+static DevBuf g_in, g_out, g_off, g_len, g_outlen, g_mask;
 
-        int tx_status = transform_segment(matched_segment, transformed_segment, tx_buf_size, flags);
-        if (tx_status == 0) {
-            size_t tx_len = strlen(transformed_segment);
-            if (dst_offset + tx_len >= dst_size) {
-                free(matched_segment);
-                free(transformed_segment);
-                return -1;
-            }
-            memcpy(dst + dst_offset, transformed_segment, tx_len);
-            dst_offset += tx_len;
-        }
+static int dev_reserve(DevBuf *b, size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (b->cap >= bytes) return 1;
+    if (b->ptr) cudaFree(b->ptr);
+    b->ptr = NULL;
+    b->cap = 0;
+    if (cudaMalloc(&b->ptr, bytes) != cudaSuccess) return 0;
+    b->cap = bytes;
+    return 1;
+}
 
-        free(matched_segment);
-        free(transformed_segment);
+static void dev_release(DevBuf *b) {
+    if (b->ptr) cudaFree(b->ptr);
+    b->ptr = NULL;
+    b->cap = 0;
+}
 
-        src_offset = match_end;
+static int dev_check(cudaError_t e, const char *what) {
+    if (e == cudaSuccess) return 1;
+    fprintf(stderr, "CUDA error during %s: %s\n", what, cudaGetErrorString(e));
+    return 0;
+}
+
+__global__ static void reduce_kernel(const char *in, const size_t *off, const size_t *len,
+                                     char *out, size_t *out_len, const unsigned char *mask,
+                                     size_t count, unsigned flags, int preserve, RuleSet rules) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    size_t o = off[idx];
+    size_t n = len[idx];
+
+    if (!mask[idx]) {
+        for (size_t k = 0; k < n; k++) out[o + k] = in[o + k];
+        out_len[idx] = n;
+        return;
+    }
+    out_len[idx] = transform_line(in + o, n, out + o, flags, preserve, &rules);
+}
+
+static int gpu_init(void) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return cudaSetDevice(0) == cudaSuccess ? 1 : 0;
+}
+
+static void gpu_shutdown(void) {
+    dev_release(&g_in);
+    dev_release(&g_out);
+    dev_release(&g_off);
+    dev_release(&g_len);
+    dev_release(&g_outlen);
+    dev_release(&g_mask);
+}
+
+static int gpu_transform(const char *in, const size_t *off, const size_t *len,
+                         char *out, size_t *out_len, const unsigned char *mask,
+                         size_t count, size_t total_bytes, unsigned flags,
+                         int preserve, const RuleSet *rules) {
+    if (count == 0) return 0;
+
+    if (!dev_reserve(&g_in, total_bytes) || !dev_reserve(&g_out, total_bytes) ||
+        !dev_reserve(&g_off, count * sizeof(size_t)) ||
+        !dev_reserve(&g_len, count * sizeof(size_t)) ||
+        !dev_reserve(&g_outlen, count * sizeof(size_t)) ||
+        !dev_reserve(&g_mask, count)) {
+        fprintf(stderr, "GPU allocation failed\n");
+        return -1;
     }
 
-    size_t remaining_len = strlen(src + src_offset);
-    if (dst_offset + remaining_len >= dst_size) return -1;
-    memcpy(dst + dst_offset, src + src_offset, remaining_len);
-    dst_offset += remaining_len;
-    dst[dst_offset] = '\0';
+    if (!dev_check(cudaMemcpy(g_in.ptr, in, total_bytes, cudaMemcpyHostToDevice), "input copy")) return -1;
+    if (!dev_check(cudaMemcpy(g_off.ptr, off, count * sizeof(size_t), cudaMemcpyHostToDevice), "offset copy")) return -1;
+    if (!dev_check(cudaMemcpy(g_len.ptr, len, count * sizeof(size_t), cudaMemcpyHostToDevice), "length copy")) return -1;
+    if (!dev_check(cudaMemcpy(g_mask.ptr, mask, count, cudaMemcpyHostToDevice), "mask copy")) return -1;
+
+    const int threads = 256;
+    const unsigned blocks = (unsigned)((count + threads - 1) / threads);
+
+    reduce_kernel<<<blocks, threads>>>(
+        (const char *)g_in.ptr,
+        (const size_t *)g_off.ptr,
+        (const size_t *)g_len.ptr,
+        (char *)g_out.ptr,
+        (size_t *)g_outlen.ptr,
+        (const unsigned char *)g_mask.ptr,
+        count, flags, preserve, *rules);
+
+    if (!dev_check(cudaGetLastError(), "kernel launch")) return -1;
+    if (!dev_check(cudaDeviceSynchronize(), "kernel execution")) return -1;
+
+    if (!dev_check(cudaMemcpy(out, g_out.ptr, total_bytes, cudaMemcpyDeviceToHost), "output copy")) return -1;
+    if (!dev_check(cudaMemcpy(out_len, g_outlen.ptr, count * sizeof(size_t), cudaMemcpyDeviceToHost), "length readback")) return -1;
 
     return 0;
 }
 
-void enqueue_job(char *line_data, char *output_data, unsigned long seq) {
-    if (!line_data || !output_data) {
-        free(line_data);
-        free(output_data);
-        return;
+#endif
+
+static void transform_batch(Ctx *c, Batch *b) {
+    compute_mask(c, b);
+
+    int use_gpu = c->gpu_ready &&
+                  (c->backend == BACKEND_GPU ||
+                   (c->backend == BACKEND_AUTO && b->bytes >= GPU_MIN_BYTES));
+
+    if (use_gpu) {
+#ifdef USE_CUDA
+        if (gpu_transform(b->in, b->off, b->len, b->out, b->out_len, b->mask,
+                          b->count, b->bytes, c->flags, c->preserve, &c->rules) == 0) {
+            c->gpu_batches++;
+            return;
+        }
+#endif
+        fprintf(stderr, "Warning: GPU transform failed, falling back to CPU\n");
+        c->gpu_ready = 0;
     }
 
-    pthread_mutex_lock(&config.queue.lock);
-    while (config.queue.count == QUEUE_SIZE) {
-        pthread_cond_wait(&config.queue.not_full, &config.queue.lock);
-    }
-    config.queue.slots[config.queue.tail].data = line_data;
-    config.queue.slots[config.queue.tail].output = output_data;
-    config.queue.slots[config.queue.tail].sequence_id = seq;
-    config.queue.tail = (config.queue.tail + 1) % QUEUE_SIZE;
-    config.queue.count++;
-    pthread_cond_signal(&config.queue.not_empty);
-    pthread_mutex_unlock(&config.queue.lock);
+    transform_cpu(c, b);
+    c->cpu_batches++;
 }
 
-void *worker_routine(void *arg) {
-    (void)arg;
-
-    while (true) {
-        JobPacket job;
-        pthread_mutex_lock(&config.queue.lock);
-        
-        while (config.queue.count == 0 && !config.queue.finished) {
-            pthread_cond_wait(&config.queue.not_empty, &config.queue.lock);
-        }
-
-        if (config.queue.count == 0 && config.queue.finished) {
-            pthread_mutex_unlock(&config.queue.lock);
-            break;
-        }
-
-        job = config.queue.slots[config.queue.head];
-        config.queue.head = (config.queue.head + 1) % QUEUE_SIZE;
-        config.queue.count--;
-        pthread_cond_signal(&config.queue.not_full);
-        pthread_mutex_unlock(&config.queue.lock);
-
-        int status = process_line(job.data, job.output, MAX_OUTPUT_SIZE, config.active_flags);
-        
-        if (status == 0) {
-            unsigned long input_tokens = estimate_tokens(job.data, config.tokenizer_type);
-            unsigned long output_tokens = estimate_tokens(job.output, config.tokenizer_type);
-
-            pthread_mutex_lock(&config.output_lock);
-            printf("%s", job.output);
-            fflush(stdout);
-            pthread_mutex_unlock(&config.output_lock);
-
-            pthread_mutex_lock(&config.stats_lock);
-            config.stats.input_tokens += input_tokens;
-            config.stats.output_tokens += output_tokens;
-            config.stats.lines_processed++;
-            pthread_mutex_unlock(&config.stats_lock);
-        } else {
-            fprintf(stderr, "Warning: Seq %lu - transformation failed\n", job.sequence_id);
-        }
-
-        free(job.data);
-        free(job.output);
+static void write_batch(Ctx *c, Batch *b, FILE *out) {
+    for (size_t i = 0; i < b->count; i++) {
+        fwrite(b->out + b->off[i], 1, b->out_len[i], out);
+        fputc('\n', out);
+        c->in_bytes  += b->len[i];
+        c->out_bytes += b->out_len[i];
+        c->lines++;
     }
-
-    return NULL;
 }
 
-void print_stats() {
-    if (config.stats.lines_processed == 0) {
+static double elapsed_ms(const struct timespec *a, const struct timespec *b) {
+    return (b->tv_sec - a->tv_sec) * 1000.0 + (b->tv_nsec - a->tv_nsec) / 1000000.0;
+}
+
+static void run_stream(Ctx *c, Batch *b, FILE *in, FILE *out) {
+    struct timespec t0, t1;
+    while (read_batch(in, b) > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        transform_batch(c, b);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        c->tx_ms += elapsed_ms(&t0, &t1);
+        write_batch(c, b, out);
+    }
+}
+
+static int is_target_file(const char *name) {
+    const char *dot = strrchr(name, '.');
+    return dot && (strcmp(dot, ".txt") == 0 || strcmp(dot, ".log") == 0 || strcmp(dot, ".md") == 0);
+}
+
+static void process_file(Ctx *c, Batch *b, const char *path) {
+    char outpath[PATH_BUF];
+    snprintf(outpath, sizeof outpath, "%s.reduced", path);
+
+    FILE *in = fopen(path, "r");
+    if (!in) { fprintf(stderr, "Warning: cannot open %s\n", path); return; }
+    FILE *out = fopen(outpath, "w");
+    if (!out) { fprintf(stderr, "Warning: cannot write %s\n", outpath); fclose(in); return; }
+
+    run_stream(c, b, in, out);
+    fclose(in);
+    fclose(out);
+    fprintf(stderr, "Processed: %s\n", path);
+}
+
+static void walk_dir(Ctx *c, Batch *b, const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) { fprintf(stderr, "Warning: cannot open directory %s\n", dir); return; }
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+
+        char path[PATH_BUF];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            walk_dir(c, b, path);
+        } else if (S_ISREG(st.st_mode) && is_target_file(e->d_name)) {
+            process_file(c, b, path);
+        }
+    }
+    closedir(d);
+}
+
+static void print_stats(const Ctx *c) {
+    if (c->lines == 0) {
         fprintf(stderr, "No data processed\n");
         return;
     }
 
-    unsigned long tokens_saved = config.stats.input_tokens - config.stats.output_tokens;
-    double savings_percent = (config.stats.input_tokens > 0) ? 
-        (100.0 * tokens_saved / config.stats.input_tokens) : 0.0;
+    const PricingModel *m = &MODELS[c->model_idx];
+    double cpt = CHARS_PER_TOKEN[c->tokenizer];
 
-    PricingModel model = MODELS[config.pricing_model_idx];
-    
-    double input_cost = (config.stats.input_tokens / 1000000.0) * model.input_price_per_mtok;
-    double output_cost_before = (config.stats.input_tokens / 1000000.0) * model.output_price_per_mtok;
-    double output_cost_after = (config.stats.output_tokens / 1000000.0) * model.output_price_per_mtok;
-    double cost_before = input_cost + output_cost_before;
-    double cost_after = input_cost + output_cost_after;
-    double savings_usd = cost_before - cost_after;
+    double in_tok  = (double)c->in_bytes / cpt;
+    double out_tok = (double)c->out_bytes / cpt;
+    double saved_tok = in_tok - out_tok;
+    double saved_pct = in_tok > 0 ? 100.0 * saved_tok / in_tok : 0.0;
+
+    double cost_before = in_tok / 1000000.0 * m->input_per_mtok;
+    double cost_after  = out_tok / 1000000.0 * m->input_per_mtok;
+    double saved_usd   = cost_before - cost_after;
+    double saved_usd_pct = cost_before > 0 ? 100.0 * saved_usd / cost_before : 0.0;
+
+    double secs = c->tx_ms / 1000.0;
+    double mbps = secs > 0 ? ((double)c->in_bytes / 1048576.0) / secs : 0.0;
 
     fprintf(stderr, "\n========== COMPRESSION STATISTICS ==========\n");
-    fprintf(stderr, "Model:               %s (%s)\n", model.name, model.model_family);
-    fprintf(stderr, "Tokenizer:           ");
-    switch(config.tokenizer_type) {
-        case TOKEN_GPT3: fprintf(stderr, "GPT-3 (char/token: 4.0)\n"); break;
-        case TOKEN_WORDPIECE: fprintf(stderr, "WordPiece (char/token: 5.0)\n"); break;
-        case TOKEN_BPE: fprintf(stderr, "BPE (char/token: 4.5)\n"); break;
-        case TOKEN_SENTENCEPIECE: fprintf(stderr, "SentencePiece (char/token: 5.0)\n"); break;
-        case TOKEN_CLAUDE: fprintf(stderr, "Claude (char/token: 3.7)\n"); break;
-        default: fprintf(stderr, "Unknown\n");
-    }
-    fprintf(stderr, "Lines processed:     %lu\n", config.stats.lines_processed);
-    fprintf(stderr, "Input tokens:        %lu\n", config.stats.input_tokens);
-    fprintf(stderr, "Output tokens:       %lu\n", config.stats.output_tokens);
-    fprintf(stderr, "Tokens saved:        %lu (%.2f%%)\n", tokens_saved, savings_percent);
-    fprintf(stderr, "Compression ratio:   %.2f%%\n", 
-            100.0 * config.stats.output_tokens / (config.stats.input_tokens ?: 1));
+    fprintf(stderr, "Model:               %s (%s)\n", m->name, m->family);
+    fprintf(stderr, "Tokenizer:           %s\n", TOKENIZER_NAMES[c->tokenizer]);
+    fprintf(stderr, "Lines processed:     %llu\n", c->lines);
+    fprintf(stderr, "Input bytes:         %llu\n", c->in_bytes);
+    fprintf(stderr, "Output bytes:        %llu\n", c->out_bytes);
+    fprintf(stderr, "Est. input tokens:   %.0f\n", in_tok);
+    fprintf(stderr, "Est. output tokens:  %.0f\n", out_tok);
+    fprintf(stderr, "Tokens saved:        %.0f (%.2f%%)\n", saved_tok, saved_pct);
     fprintf(stderr, "Cost before:         $%.6f\n", cost_before);
     fprintf(stderr, "Cost after:          $%.6f\n", cost_after);
-    fprintf(stderr, "Money saved:         $%.6f (%.2f%%)\n", savings_usd, 
-            (cost_before > 0) ? (100.0 * savings_usd / cost_before) : 0.0);
-    fprintf(stderr, "Processing time:     %.2f ms\n", config.stats.processing_time_ms);
-    fprintf(stderr, "Throughput:          %.0f chars/sec\n",
-            (config.stats.processing_time_ms > 0) ? 
-            ((config.stats.input_tokens * MODELS[config.pricing_model_idx].token_ratio / 100.0 / 1024) / 
-             (config.stats.processing_time_ms / 1000.0)) : 0);
+    fprintf(stderr, "Money saved:         $%.6f (%.2f%%)\n", saved_usd, saved_usd_pct);
+    if (c->time_on) {
+        fprintf(stderr, "Transform time:      %.2f ms\n", c->tx_ms);
+        fprintf(stderr, "Throughput:          %.2f MB/s\n", mbps);
+        fprintf(stderr, "Batches (GPU/CPU):   %lu / %lu\n", c->gpu_batches, c->cpu_batches);
+    }
     fprintf(stderr, "============================================\n");
 }
 
-void print_models() {
-    fprintf(stderr, "\nSupported Pricing Models:\n");
-    fprintf(stderr, "========================\n");
+static void print_models(void) {
+    fprintf(stderr, "\nSupported Pricing Models (input/output per 1M tokens):\n");
+    fprintf(stderr, "======================================================\n");
     for (size_t i = 0; i < MODEL_COUNT; i++) {
-        fprintf(stderr, "%2zu. %-25s $%.2f/$%.2f per 1M tokens (input/output)\n",
-                i, MODELS[i].name, MODELS[i].input_price_per_mtok, MODELS[i].output_price_per_mtok);
+        fprintf(stderr, "%2zu. %-20s $%.2f / $%.2f\n",
+                i, MODELS[i].name, MODELS[i].input_per_mtok, MODELS[i].output_per_mtok);
     }
     fprintf(stderr, "\n");
 }
 
-void print_help(const char *prog_name) {
-    printf("\n");
-    printf("========================================================================\n");
-    printf(" TOKEN REDUCTION ENGINE v3.0 - COMPLETE DOCUMENTATION\n");
-    printf("========================================================================\n\n");
-    
-    printf("OVERVIEW:\n");
-    printf("  High-performance text reduction engine designed to minimize API costs\n");
-    printf("  by stripping fillers, abbreviating common words, and compressing output.\n");
-    printf("  Supports multiple tokenization methods and LLM pricing models.\n\n");
-
+static void print_help(const char *prog) {
+    printf("TOKEN REDUCTION ENGINE v%s\n\n", VERSION);
+    printf("Reduces text size before it is sent to an LLM. Reads stdin, writes stdout.\n\n");
     printf("USAGE:\n");
-    printf("  %s [options] < input_file\n", prog_name);
-    printf("  %s [options] --batch /path/to/directory/\n\n", prog_name);
-
-    printf("TRANSFORMATION FLAGS:\n");
-    printf("  --ws                Standardize whitespace (collapse spaces)\n");
-    printf("  --filler            Remove filler words (very, really, quite, etc.)\n");
-    printf("  --compress          Collapse duplicate character runs (aaa -> a)\n");
-    printf("  --abbr              Abbreviate common words (information -> info)\n");
-    printf("  --aggressive        Enable all transformations (default if no flags)\n\n");
-
-    printf("QUALITY & FILTERING:\n");
-    printf("  --preserve          Skip URLs, emails, and code blocks\n");
-    printf("  --match <regex>     Only transform lines matching regex pattern\n\n");
-
-    printf("TOKEN COUNTING & PRICING:\n");
-    printf("  --tokenizer <type>  Choose tokenization method:\n");
-    printf("                      0=gpt3 (4.0 chars/token, default)\n");
-    printf("                      1=wordpiece (5.0 chars/token)\n");
-    printf("                      2=bpe (4.5 chars/token)\n");
-    printf("                      3=sentencepiece (5.0 chars/token)\n");
-    printf("                      4=claude (3.7 chars/token)\n");
-    printf("  --model <idx>       Select pricing model (see --show-models):\n");
-    printf("                      Default: 0 (GPT-4o)\n");
-    printf("  --show-models       Display all available pricing models\n\n");
-
-    printf("BATCH PROCESSING:\n");
-    printf("  --batch <dir>       Process all files in directory recursively\n");
-    printf("  --stats             Show compression statistics on stderr\n");
-    printf("  --time              Show execution timing details\n\n");
-
-    printf("DOCUMENTATION:\n");
-    printf("  -h, --help          Display this help message\n");
-    printf("  --show-models       Show available LLM pricing models\n\n");
-
-    printf("EXAMPLES:\n\n");
-    printf("1. Basic compression with statistics:\n");
-    printf("   cat large_file.txt | %s --stats\n\n", prog_name);
-
-    printf("2. Preserve URLs/code, show costs for Claude Opus:\n");
-    printf("   %s --preserve --model 3 --stats < input.txt\n\n", prog_name);
-
-    printf("3. Process all text files in directory with GPT-3.5 pricing:\n");
-    printf("   %s --batch /data/logs/ --model 2 --stats\n\n", prog_name);
-
-    printf("4. Use BPE tokenization with detailed timing:\n");
-    printf("   %s --tokenizer 2 --time --stats < input.txt\n\n", prog_name);
-
-    printf("5. Selective transformation with regex filtering:\n");
-    printf("   %s --match \"^LOG:\" --aggressive --stats < input.txt\n\n", prog_name);
-
-    printf("TOKENIZATION METHODS:\n");
-    printf("  GPT-3          Used by OpenAI GPT-3/3.5. Approximately 4 chars = 1 token.\n");
-    printf("  WordPiece      Used by BERT models. Approximately 5 chars = 1 token.\n");
-    printf("  BPE            Used by GPT-2/GPT-4. Approximately 4.5 chars = 1 token.\n");
-    printf("  SentencePiece  Used by T5/mBART. Approximately 5 chars = 1 token.\n");
-    printf("  Claude         Used by Anthropic Claude. Approximately 3.7 chars = 1 token.\n\n");
-
-    printf("COST CALCULATION:\n");
-    printf("  Savings are calculated by comparing input token cost against\n");
-    printf("  output token cost using the selected model's pricing.\n");
-    printf("  Formula: (input_tokens / 1M) * input_price + (output_tokens / 1M) * output_price\n\n");
-
-    printf("PERFORMANCE NOTES:\n");
-    printf("  - Runs 4 parallel worker threads by default\n");
-    printf("  - Processes stdin line-by-line\n");
-    printf("  - Batch mode processes files matching *.txt, *.log, *.md patterns\n");
-    printf("  - Maximum line size: 65KB\n\n");
-
-    printf("========================================================================\n\n");
+    printf("  %s [options] < input.txt\n", prog);
+    printf("  %s [options] --batch <dir>     writes <file>.reduced beside each .txt/.log/.md\n\n", prog);
+    printf("TRANSFORMATIONS (default with none given: --aggressive):\n");
+    printf("  --ws           Collapse whitespace runs to one space (leading indentation is kept)\n");
+    printf("  --filler       Remove filler words: really, very, quite, just, actually, basically\n");
+    printf("  --abbr         Abbreviate common words (information -> info, thank you -> ty, ...)\n");
+    printf("  --compress     Cap runs of 4+ decorative characters (- = _ * # ~) at three\n");
+    printf("  --aggressive   --ws --filler --abbr\n\n");
+    printf("FILTERING:\n");
+    printf("  --preserve     Leave URLs, emails, and `backtick code` untouched\n");
+    printf("  --match <re>   Transform only lines matching the extended regex (case-insensitive)\n\n");
+    printf("EXECUTION:\n");
+    printf("  --backend <b>  cpu | gpu | auto (default auto; GPU used for batches >= 4 MB)\n");
+    printf("  --threads <n>  CPU worker threads, 1-%d (default %d)\n\n", MAX_THREADS, DEFAULT_THREADS);
+    printf("COST ESTIMATE:\n");
+    printf("  --tokenizer <n>  0=GPT-3 1=WordPiece 2=BPE 3=SentencePiece 4=Claude (default 0)\n");
+    printf("  --model <n>      Pricing model index (default 0, see --show-models)\n");
+    printf("  --show-models    List pricing models\n");
+    printf("  --stats          Print statistics to stderr\n");
+    printf("  --time           Statistics plus timing and throughput\n\n");
+    printf("  -h, --help       Show this help\n\n");
+    printf("EXAMPLES:\n");
+    printf("  cat prompt.txt | %s --stats\n", prog);
+    printf("  %s --preserve --match \"^LOG:\" --model 3 --stats < input.txt\n", prog);
+    printf("  %s --batch ./logs --backend gpu --time\n", prog);
 }
 
-int main(int argc, char *argv[]) {
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+static int parse_long(const char *s, long lo, long hi, long *value) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno != 0 || v < lo || v > hi) return -1;
+    *value = v;
+    return 0;
+}
 
-    config.active_flags = 0;
-    config.has_regex = false;
-    config.stats_mode = false;
-    config.preserve_semantics = false;
-    config.time_mode = false;
-    config.tokenizer_type = TOKEN_GPT3;
-    config.pricing_model_idx = 0;
-    config.batch_mode = false;
-    memset(config.batch_dir, 0, sizeof(config.batch_dir));
-
-    config.queue.head = 0;
-    config.queue.tail = 0;
-    config.queue.count = 0;
-    config.queue.finished = false;
-
-    memset(&config.stats, 0, sizeof(CompressionStats));
-
-    if (pthread_mutex_init(&config.queue.lock, NULL) != 0 ||
-        pthread_cond_init(&config.queue.not_full, NULL) != 0 ||
-        pthread_cond_init(&config.queue.not_empty, NULL) != 0 ||
-        pthread_mutex_init(&config.output_lock, NULL) != 0 ||
-        pthread_mutex_init(&config.stats_lock, NULL) != 0) {
-        fprintf(stderr, "Fatal: synchronization init failed\n");
-        return 1;
+static const char *next_arg(int argc, char **argv, int *i) {
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "Fatal: %s requires an argument\n", argv[*i]);
+        exit(1);
     }
+    return argv[++(*i)];
+}
+
+int main(int argc, char **argv) {
+    Ctx c;
+    memset(&c, 0, sizeof c);
+    c.threads = DEFAULT_THREADS;
+    c.backend = BACKEND_AUTO;
+
+    unsigned user_flags = 0;
+    const char *batch_dir = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+        const char *a = argv[i];
+        long v = 0;
+
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             print_help(argv[0]);
-            goto cleanup;
-        } else if (strcmp(argv[i], "--show-models") == 0) {
+            return 0;
+        } else if (strcmp(a, "--show-models") == 0) {
             print_models();
-            goto cleanup;
-        } else if (strcmp(argv[i], "--ws") == 0) {
-            config.active_flags |= MODE_WS;
-        } else if (strcmp(argv[i], "--filler") == 0) {
-            config.active_flags |= MODE_FILLER;
-        } else if (strcmp(argv[i], "--compress") == 0) {
-            config.active_flags |= MODE_COMPRESS;
-        } else if (strcmp(argv[i], "--abbr") == 0) {
-            config.active_flags |= MODE_ABBR;
-        } else if (strcmp(argv[i], "--aggressive") == 0) {
-            config.active_flags |= MODE_AGGRESSIVE;
-        } else if (strcmp(argv[i], "--stats") == 0) {
-            config.stats_mode = true;
-        } else if (strcmp(argv[i], "--time") == 0) {
-            config.time_mode = true;
-            config.stats_mode = true;
-        } else if (strcmp(argv[i], "--preserve") == 0) {
-            config.preserve_semantics = true;
-        } else if (strcmp(argv[i], "--tokenizer") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Fatal: --tokenizer requires argument\n");
-                goto cleanup;
-            }
-            config.tokenizer_type = atoi(argv[++i]);
-            if (config.tokenizer_type < 0 || config.tokenizer_type >= 5) {
-                fprintf(stderr, "Fatal: tokenizer must be 0-4\n");
-                goto cleanup;
-            }
-        } else if (strcmp(argv[i], "--model") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Fatal: --model requires argument\n");
-                goto cleanup;
-            }
-            config.pricing_model_idx = atoi(argv[++i]);
-            if (config.pricing_model_idx < 0 || config.pricing_model_idx >= (int)MODEL_COUNT) {
-                fprintf(stderr, "Fatal: model index out of range (0-%zu)\n", MODEL_COUNT - 1);
-                goto cleanup;
-            }
-        } else if (strcmp(argv[i], "--batch") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Fatal: --batch requires directory path\n");
-                goto cleanup;
-            }
-            config.batch_mode = true;
-            strncpy(config.batch_dir, argv[++i], sizeof(config.batch_dir) - 1);
-        } else if (strcmp(argv[i], "--match") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Fatal: --match requires regex argument\n");
-                goto cleanup;
-            }
-            if (regcomp(&config.match_regex, argv[++i], REG_EXTENDED | REG_ICASE) != 0) {
-                fprintf(stderr, "Fatal: invalid regex syntax\n");
-                goto cleanup;
-            }
-            config.has_regex = true;
+            return 0;
+        } else if (strcmp(a, "--ws") == 0) {
+            user_flags |= MODE_WS;
+        } else if (strcmp(a, "--filler") == 0) {
+            user_flags |= MODE_FILLER;
+        } else if (strcmp(a, "--compress") == 0) {
+            user_flags |= MODE_COMPRESS;
+        } else if (strcmp(a, "--abbr") == 0) {
+            user_flags |= MODE_ABBR;
+        } else if (strcmp(a, "--aggressive") == 0) {
+            user_flags |= MODE_AGGRESSIVE;
+        } else if (strcmp(a, "--preserve") == 0) {
+            c.preserve = 1;
+        } else if (strcmp(a, "--stats") == 0) {
+            c.stats_on = 1;
+        } else if (strcmp(a, "--time") == 0) {
+            c.stats_on = 1;
+            c.time_on = 1;
+        } else if (strcmp(a, "--tokenizer") == 0) {
+            if (parse_long(next_arg(argc, argv, &i), 0, TOKEN_COUNT - 1, &v) != 0)
+                die("--tokenizer must be 0-4");
+            c.tokenizer = (int)v;
+        } else if (strcmp(a, "--model") == 0) {
+            if (parse_long(next_arg(argc, argv, &i), 0, (long)MODEL_COUNT - 1, &v) != 0)
+                die("--model index out of range (see --show-models)");
+            c.model_idx = (int)v;
+        } else if (strcmp(a, "--threads") == 0) {
+            if (parse_long(next_arg(argc, argv, &i), 1, MAX_THREADS, &v) != 0)
+                die("--threads must be between 1 and 64");
+            c.threads = (int)v;
+        } else if (strcmp(a, "--backend") == 0) {
+            const char *b = next_arg(argc, argv, &i);
+            if (strcmp(b, "cpu") == 0) c.backend = BACKEND_CPU;
+            else if (strcmp(b, "gpu") == 0) c.backend = BACKEND_GPU;
+            else if (strcmp(b, "auto") == 0) c.backend = BACKEND_AUTO;
+            else die("--backend must be cpu, gpu, or auto");
+        } else if (strcmp(a, "--match") == 0) {
+            if (regcomp(&c.re, next_arg(argc, argv, &i),
+                        REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0)
+                die("invalid regex");
+            c.has_regex = 1;
+        } else if (strcmp(a, "--batch") == 0) {
+            batch_dir = next_arg(argc, argv, &i);
         } else {
-            fprintf(stderr, "Unknown parameter: %s. Use --help for reference\n", argv[i]);
-            goto cleanup;
+            fprintf(stderr, "Unknown parameter: %s. Use --help for reference.\n", a);
+            return 1;
         }
     }
 
-    if (config.active_flags == 0) {
-        config.active_flags = MODE_AGGRESSIVE;
+    c.flags = user_flags ? user_flags : MODE_AGGRESSIVE;
+    ruleset_init(&c.rules);
+
+#ifdef USE_CUDA
+    c.gpu_ready = gpu_init();
+#endif
+    if (c.backend == BACKEND_GPU && !c.gpu_ready) {
+        die("--backend gpu requested, but no CUDA device is available or this build has no GPU support");
     }
 
-    pthread_t workers[DEFAULT_NUM_WORKERS];
-    for (int i = 0; i < DEFAULT_NUM_WORKERS; i++) {
-        if (pthread_create(&workers[i], NULL, worker_routine, NULL) != 0) {
-            fprintf(stderr, "Fatal: pthread_create failed\n");
-            goto cleanup;
-        }
+    Batch b;
+    if (batch_init(&b) != 0) die("out of memory");
+
+    if (batch_dir) {
+        walk_dir(&c, &b, batch_dir);
+    } else {
+        run_stream(&c, &b, stdin, stdout);
     }
 
-    char input_buf[BUFFER_SIZE];
-    unsigned long sequence_counter = 0;
+    fflush(stdout);
+    if (c.stats_on) print_stats(&c);
 
-    while (fgets(input_buf, BUFFER_SIZE, stdin) != NULL) {
-        char *heap_line = malloc(strlen(input_buf) + 1);
-        char *out_buf = malloc(MAX_OUTPUT_SIZE);
-
-        if (!heap_line || !out_buf) {
-            fprintf(stderr, "Fatal: malloc failed\n");
-            free(heap_line);
-            free(out_buf);
-            break;
-        }
-
-        strcpy(heap_line, input_buf);
-        enqueue_job(heap_line, out_buf, sequence_counter++);
-    }
-
-    pthread_mutex_lock(&config.queue.lock);
-    config.queue.finished = true;
-    pthread_cond_broadcast(&config.queue.not_empty);
-    pthread_mutex_unlock(&config.queue.lock);
-
-    for (int i = 0; i < DEFAULT_NUM_WORKERS; i++) {
-        pthread_join(workers[i], NULL);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
-                        (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
-    config.stats.processing_time_ms = elapsed_ms;
-
-    if (config.stats_mode) {
-        print_stats();
-    }
-
-cleanup:
-    if (config.has_regex) {
-        regfree(&config.match_regex);
-    }
-    pthread_mutex_destroy(&config.queue.lock);
-    pthread_cond_destroy(&config.queue.not_full);
-    pthread_cond_destroy(&config.queue.not_empty);
-    pthread_mutex_destroy(&config.output_lock);
-    pthread_mutex_destroy(&config.stats_lock);
-
+    batch_free(&b);
+    if (c.has_regex) regfree(&c.re);
+#ifdef USE_CUDA
+    gpu_shutdown();
+#endif
     return 0;
 }
